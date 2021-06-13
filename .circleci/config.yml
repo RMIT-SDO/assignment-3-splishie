@@ -31,7 +31,7 @@ commands:
           sudo curl -LO https://github.com/kubernetes/kops/releases/download/v1.18.0/kops-linux-amd64
           sudo chmod +x kops-linux-amd64
           sudo mv kops-linux-amd64 /usr/local/bin/kops
-          kops export kubecfg rmit.k8s.local --state s3://rmit-kops-state-<<update-me>>
+          kops export kubecfg rmit.k8s.local --state s3://rmit-kops-state-c4509u
 
   smoke-test:
     parameters:
@@ -41,6 +41,24 @@ commands:
     steps:
       - run:
           name: Smoke test
+          command: |
+            export endpoint=$(kubectl get service/todo-app -n << parameters.envName >> -o json | jq '.status.loadBalancer.ingress[0].hostname' | sed -e 's/^"//' -e 's/"$//')
+            echo $endpoint
+            export returncode=$(curl -s -o /dev/null -w "%{http_code}" ${endpoint})
+            if [ $returncode -ne "200" ]
+            then
+              echo "Return Code was not 200, it was: ${returncode}"
+              exit 1
+            fi
+  
+  smoke-prod:
+    parameters:
+      envName: 
+        type: string
+        default: "prod"
+    steps:
+      - run:
+          name: Smoke prod
           command: |
             export endpoint=$(kubectl get service/todo-app -n << parameters.envName >> -o json | jq '.status.loadBalancer.ingress[0].hostname' | sed -e 's/^"//' -e 's/"$//')
             echo $endpoint
@@ -103,11 +121,10 @@ jobs:
             mv ./kubectl /usr/local/bin/kubectl
 
             # configure kops
-            sudo curl -LO https://github.com/kubernetes/kops/releases/download/v1.18.0/kops-linux-amd64
-            sudo chmod +x kops-linux-amd64
-            sudo mv kops-linux-amd64 /usr/local/bin/kops
-            kops export kubecfg rmit.k8s.local --state s3://rmit-kops-state-<<update-me>>
-
+            curl -LO https://github.com/kubernetes/kops/releases/download/v1.18.0/kops-linux-amd64
+            chmod +x kops-linux-amd64
+            mv kops-linux-amd64 /usr/local/bin/kops
+            kops export kubecfg rmit.k8s.local --state s3://rmit-kops-state-c4509u
             apt-get install jq -y
 
       - run:
@@ -128,8 +145,8 @@ jobs:
   package:
     machine: true
     environment:
-      ECR: <update-me>
-      reponame: <update-me>
+      ECR: 682325028273.dkr.ecr.us-east-1.amazonaws.com
+      reponame: rmit-assignment3-container-repo
     steps:
       - checkout
 
@@ -173,12 +190,75 @@ jobs:
           root: ./
           paths:
             - artifacts
+    
+  deploy-test:
+    docker:
+      - image: cimg/base:2020.01
+    environment:
+      ENV: test
+    steps:
+      - attach_workspace:
+          at: ./
+      - setup-cd
+      - run:
+          name: deploy infra
+          command: |
+            cd artifacts/infra
+            make init
+            make up
+            terraform output db_endpoint > ../dbendpoint.txt
+      - run:
+          name: deploy app
+          command: |
+             helm upgrade todo artifacts/todo-0.1.0.tgz -i -n test --wait --set image=$(cat artifacts/image.txt),dbhost=$(cat artifacts/dbendpoint.txt)
+      - smoke-test
+
+  deploy-prod:
+    docker:
+      - image: cimg/base:2020.01
+    environment:
+      ENV: prod
+    steps:
+      - attach_workspace:
+          at: ./
+      - setup-cd
+      - run:
+          name: deploy infra
+          command: |
+            cd artifacts/infra
+            make init
+            make up
+            terraform output db_endpoint > ../dbendpoint.txt
+      - run:
+          name: deploy app
+          command: |
+             helm upgrade todo artifacts/todo-0.1.0.tgz -i -n prod --wait --set image=$(cat artifacts/image.txt),dbhost=$(cat artifacts/dbendpoint.txt)
+      - run:
+          name: create logging and monitoring with cloudwatch
+          command: |
+            kubectl create configmap cluster-info --from-literal=cluster.name=rmit.k8s.local --from-literal=logs.region=us-east-1 -n amazon-cloudwatch
+            wget https://raw.githubusercontent.com/aws-samples/amazon-cloudwatch-container-insights/latest/k8s-deployment-manifest-templates/deployment-mode/daemonset/container-insights-monitoring/fluentd/fluentd.yaml
+            kubectl apply -f fluentd.yaml
+      - smoke-prod
 
 workflows:
   version: 2
   build-test-package:
     jobs:
       - build
+      - deploy-test:
+          requires:
+            - package
+      - e2e:
+          requires:
+            - deploy-test
+      - deploy-prod:
+          requires:
+            - approval
+      - approval:
+          type: approval
+          requires:
+          - deploy-test
       - integration-test:
           requires: 
             - build
@@ -187,4 +267,4 @@ workflows:
             - integration-test
           filters:
             branches:
-              only: master
+              only: main
